@@ -1,6 +1,9 @@
 import createNextIntlPlugin from 'next-intl/plugin';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const withNextIntl = createNextIntlPlugin('./i18n.ts');
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
@@ -21,6 +24,7 @@ const nextConfig = {
   // 启用standalone输出模式，用于Docker部署
   // 根据环境变量决定是否启用
   output: process.env.DOCKER_BUILD === 'true' ? 'standalone' : undefined,
+  outputFileTracingRoot: __dirname,
 
   // 服务器外部包配置
   serverExternalPackages: ['pg'],
@@ -73,32 +77,32 @@ const nextConfig = {
       resourceRegExp: /^pg-native$|^cloudflare:sockets$/,
     }))
 
-    // 在生产环境中忽略测试页面和调试模块
-    if (process.env.NODE_ENV === 'production') {
-      // 忽略调试和测试页面
-      config.plugins.push(new webpack.IgnorePlugin({
-        resourceRegExp: /test-captcha|test-tab-freeze/,
-        contextRegExp: /app\/\[locale\]/,
-      }))
+    // // 在生产环境中忽略测试页面和调试模块
+    // if (process.env.NODE_ENV === 'production') {
+    //   // 忽略调试和测试页面
+    //   config.plugins.push(new webpack.IgnorePlugin({
+    //     resourceRegExp: /test-captcha|test-tab-freeze/,
+    //     contextRegExp: /app\/\[locale\]/,
+    //   }))
 
-      // 忽略整个 debug 目录
-      config.plugins.push(new webpack.IgnorePlugin({
-        resourceRegExp: /.*/,
-        contextRegExp: /app\/debug/,
-      }))
+    //   // 忽略整个 debug 目录
+    //   config.plugins.push(new webpack.IgnorePlugin({
+    //     resourceRegExp: /.*/,
+    //     contextRegExp: /app\/debug/,
+    //   }))
 
-      // 忽略 API debug 目录
-      config.plugins.push(new webpack.IgnorePlugin({
-        resourceRegExp: /.*/,
-        contextRegExp: /app\/api\/debug/,
-      }))
+    //   // 忽略 API debug 目录
+    //   config.plugins.push(new webpack.IgnorePlugin({
+    //     resourceRegExp: /.*/,
+    //     contextRegExp: /app\/api\/debug/,
+    //   }))
 
-      // 忽略测试相关的 API 路由
-      config.plugins.push(new webpack.IgnorePlugin({
-        resourceRegExp: /test-auth|test-model|test-rate-limit|^test$/,
-        contextRegExp: /app\/api/,
-      }))
-    }
+    //   // 忽略测试相关的 API 路由
+    //   config.plugins.push(new webpack.IgnorePlugin({
+    //     resourceRegExp: /test-auth|test-model|test-rate-limit|^test$/,
+    //     contextRegExp: /app\/api/,
+    //   }))
+    // }
 
     // 在客户端构建中忽略 PostgreSQL 相关模块
     if (!isServer) {
