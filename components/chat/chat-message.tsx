@@ -3,7 +3,6 @@
 import React from "react"
 import { EnhancedMessageRenderer } from "@/components/enhanced-message-renderer"
 import { MessageOperations } from "./message-operations"
-import type { Message } from "ai"
 import type { ChatMessage } from "@/types/chat"
 import styles from "../../app/[locale]/chat/chat.module.css"
 

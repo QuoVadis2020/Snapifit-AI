@@ -1,6 +1,14 @@
 import { getSupabaseAdmin } from '@/lib/supabase'
 import { PasswordManager } from './password'
 import { InviteCodeManager } from './invite-code-manager'
+import type { SupabaseCompatClient } from '@/lib/database/adapters/supabase-compat'
+import { randomUUID } from 'crypto'
+
+type PasswordUserCreateResult = {
+  success: boolean
+  user_id?: string
+  error?: string | null
+}
 
 /**
  * 用户管理类
@@ -91,8 +99,8 @@ export class UserManager {
       // 生成邮箱验证令牌
       const emailVerificationToken = PasswordManager.generateEmailVerificationToken()
 
-      // 调用数据库函数创建用户
-      console.log('🔧 Calling create_user_with_password with:', {
+      // 密码用户注册保留数据库函数原有语义：查重、首个用户升超管、邀请码升 LV3。
+      console.log('🔧 Creating password user with application logic:', {
         p_username: username,
         p_email: email,
         p_display_name: displayName || username,
@@ -100,27 +108,17 @@ export class UserManager {
         passwordHashLength: passwordHash?.length
       })
 
-      const { data, error } = await supabase
-        .rpc('create_user_with_password', {
-          p_username: username,
-          p_email: email,
-          p_password_hash: passwordHash,
-          p_display_name: displayName || username,
-          p_invite_code: inviteCode || null
-        })
+      const result = await this.createPasswordUserRecord(supabase, {
+        username,
+        email,
+        passwordHash,
+        displayName: displayName || username,
+        inviteCode: inviteCode || null
+      })
 
-      console.log('🔧 Database function response:', { data, error })
-
-      if (error) {
-        console.error('🔧 Database error:', error)
-        throw error
-      }
-
-      // 数据库函数返回的是数组，需要访问第一个元素
-      const result = Array.isArray(data) ? data[0] : data
       if (!result || !result.success) {
-        console.error('🔧 Function returned success=false, error:', result?.error)
-        throw new Error(result?.error || 'Unknown database error')
+        console.error('🔧 Password user creation failed:', result?.error)
+        throw new Error(result?.error || 'Failed to create user')
       }
 
       // 更新邮箱验证令牌和默认信任等级（如果没有邀请码且不是第一个用户）
@@ -128,7 +126,7 @@ export class UserManager {
 
       // 检查是否是第一个用户（通过检查返回的用户角色）
       // 如果是第一个用户，数据库函数已经设置了正确的信任等级和角色，不需要覆盖
-      const isFirstUser = result.user_id && await this.checkIfFirstUser(result.user_id)
+      const isFirstUser = result.user_id ? await this.checkIfFirstUser(result.user_id) : false
 
       // 如果没有使用邀请码且不是第一个用户，应用系统配置的默认信任等级
       if (!inviteCode && !isFirstUser) {
@@ -164,6 +162,174 @@ export class UserManager {
         success: false,
         error: error instanceof Error ? error.message : 'Failed to create user'
       }
+    }
+  }
+
+  private static async createPasswordUserRecord(
+    supabase: SupabaseCompatClient,
+    params: {
+      username: string
+      email: string
+      passwordHash: string
+      displayName: string
+      inviteCode: string | null
+    }
+  ): Promise<PasswordUserCreateResult> {
+    const normalizedInviteCode = params.inviteCode?.toUpperCase() || null
+
+    const { data: existingUsername, error: usernameError } = await supabase
+      .from('users')
+      .select('id')
+      .eq('username', params.username)
+      .limit(1)
+
+    if (usernameError) {
+      throw usernameError
+    }
+
+    if (Array.isArray(existingUsername) && existingUsername.length > 0) {
+      return { success: false, error: 'Username already exists' }
+    }
+
+    const { data: existingEmail, error: emailError } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', params.email)
+      .limit(1)
+
+    if (emailError) {
+      throw emailError
+    }
+
+    if (Array.isArray(existingEmail) && existingEmail.length > 0) {
+      return { success: false, error: 'Email already exists' }
+    }
+
+    const { data: allUsers, error: countError } = await supabase
+      .from('users')
+      .select('id')
+      .limit(1)
+
+    if (countError) {
+      throw countError
+    }
+
+    const isFirstUser = !allUsers || (Array.isArray(allUsers) && allUsers.length === 0)
+    const userId = randomUUID()
+    let trustLevel = isFirstUser ? 4 : 0
+    const role = isFirstUser ? 'super_admin' : 'user'
+    let inviteCodeId: string | null = null
+
+    if (!isFirstUser && normalizedInviteCode) {
+      const { data: inviteCodes, error: inviteError } = await supabase
+        .from('invite_codes')
+        .select('id, expires_at')
+        .eq('code', normalizedInviteCode)
+        .eq('is_active', true)
+        .is('used_by', null)
+        .limit(1)
+
+      if (inviteError) {
+        throw inviteError
+      }
+
+      const inviteCode = Array.isArray(inviteCodes) ? inviteCodes[0] : inviteCodes
+      if (!inviteCode || (inviteCode.expires_at && new Date(inviteCode.expires_at) <= new Date())) {
+        return { success: false, error: 'Invalid or expired invite code' }
+      }
+
+      inviteCodeId = inviteCode.id
+      trustLevel = 3
+
+      const { data: reservedInviteCode, error: reserveInviteError } = await supabase
+        .from('invite_codes')
+        .update({
+          used_by: userId,
+          used_at: new Date().toISOString(),
+          is_active: false
+        })
+        .eq('id', inviteCodeId)
+        .eq('is_active', true)
+        .is('used_by', null)
+        .select('id')
+
+      if (reserveInviteError) {
+        throw reserveInviteError
+      }
+
+      const reservedCode = Array.isArray(reservedInviteCode) ? reservedInviteCode[0] : reservedInviteCode
+      if (!reservedCode) {
+        return { success: false, error: 'Invalid or expired invite code' }
+      }
+    }
+
+    const now = new Date().toISOString()
+    const { data: user, error: insertError } = await supabase
+      .from('users')
+      .insert({
+        id: userId,
+        username: params.username,
+        email: params.email,
+        password_hash: params.passwordHash,
+        display_name: params.displayName,
+        trust_level: trustLevel,
+        role,
+        provider_type: 'credentials',
+        is_active: true,
+        is_silenced: false,
+        email_verified: false,
+        created_at: now,
+        updated_at: now
+      })
+      .select('id')
+      .single()
+
+    if (insertError) {
+      if (inviteCodeId) {
+        const { error: releaseInviteError } = await supabase
+          .from('invite_codes')
+          .update({
+            used_by: null,
+            used_at: null,
+            is_active: true
+          })
+          .eq('id', inviteCodeId)
+          .eq('used_by', userId)
+
+        if (releaseInviteError) {
+          console.warn('⚠️ Failed to release reserved invite code after user insert failure:', releaseInviteError)
+        }
+      }
+      throw insertError
+    }
+
+    if (!user?.id) {
+      return { success: false, error: 'Failed to create user' }
+    }
+
+    if (isFirstUser) {
+      const { error: configError } = await supabase
+        .from('invite_configs')
+        .insert({
+          user_id: user.id,
+          interval_days: 1,
+          codes_per_batch: 10,
+          max_total_codes: 1000,
+          is_active: true,
+          created_by: user.id,
+          created_at: now,
+          updated_at: now
+        })
+
+      if (configError) {
+        console.warn('⚠️ Failed to create default invite config for first user:', configError)
+      }
+    }
+
+    return {
+      success: true,
+      user_id: user.id,
+      error: null
     }
   }
 

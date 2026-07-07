@@ -1,4 +1,3 @@
-import type { Message } from "ai"
 import type { LucideIcon } from "lucide-react"
 
 export interface ImagePreview {
@@ -17,7 +16,12 @@ export interface ExpertRole {
   systemPrompt: string
 }
 
-export interface ChatMessage extends Message {
+export type ChatMessageRole = "user" | "assistant" | "system"
+
+export interface ChatMessage {
+  id: string
+  role: ChatMessageRole
+  content: string
   images?: string[]
 }
 

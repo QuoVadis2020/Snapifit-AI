@@ -1,7 +1,6 @@
 "use client"
 
-import React, { useState, useRef, useEffect, useCallback } from "react"
-import { useChat } from "@ai-sdk/react"
+import React, { useState, useRef, useEffect } from "react"
 import { Card, CardContent } from "@/components/ui/card"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useToast } from "@/hooks/use-toast"
@@ -13,7 +12,6 @@ import { useImageUpload } from "@/hooks/use-image-upload"
 import { useChatExport } from "@/hooks/use-chat-export"
 import type { AIConfig, AIMemoryUpdateRequest } from "@/lib/types"
 import { format } from "date-fns"
-import type { Message } from "ai"
 import { useTranslation } from "@/hooks/use-i18n"
 import { expertRoles } from "@/constants/expert-roles"
 import type { ExpertRole, ExpertDisplayInfo, ChatMessage } from "@/types/chat"
@@ -47,6 +45,9 @@ export default function ChatPage() {
   const [isMobile, setIsMobile] = useState(false)
   const [showExpertDropdown, setShowExpertDropdown] = useState(false)
   const [isCustomLoading, setIsCustomLoading] = useState(false)
+  const [chatError, setChatError] = useState<Error | null>(null)
+  const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [input, setInput] = useState("")
   const [allowedTools, setAllowedTools] = useState<string[]>(() => {
     try { return JSON.parse(localStorage.getItem('mcp.allowedTools') || '[]') } catch { return [] }
   })
@@ -82,7 +83,7 @@ export default function ChatPage() {
   const { memories, updateMemory } = useAIMemory()
 
   // 为每个专家使用独立的聊天记录
-  const [allExpertMessages, setAllExpertMessages] = useLocalStorage<Record<string, Message[]>>("expertChatMessages", {})
+  const [allExpertMessages, setAllExpertMessages] = useLocalStorage<Record<string, ChatMessage[]>>("expertChatMessages", {})
 
   // 使用自定义钩子
   const {
@@ -233,91 +234,161 @@ export default function ChatPage() {
 - tool_name 必须与系统提供的“允许的工具集合”之一严格匹配；如无匹配，避免调用。
 `
 
-  const { messages, input, handleInputChange, handleSubmit, isLoading, error, setMessages, setInput } = useChat({
-    api: "/api/openai/chat",
-    initialMessages: [],
-    headers: {
-      "x-ai-config": JSON.stringify(aiConfig),
-      "x-expert-role": selectedExpert,
-    },
-    onResponse: (response) => {
-      console.log("Chat response received:", {
-        ok: response.ok,
-        status: response.status,
-        statusText: response.statusText,
-      })
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setInput(e.target.value)
+  }
 
-      if (!response.ok) {
-        console.error("Chat response not ok:", response.status, response.statusText)
-        toast({
-          title: "聊天失败",
-          description: `服务器响应错误: ${response.status} ${response.statusText}`,
-          variant: "destructive",
-        })
-      }
-    },
-    onError: (error) => {
-      console.error("Chat error:", error)
+  const getAllowedToolsLabel = () => {
+    return Array.isArray(allowedTools) && allowedTools.length > 0
+      ? allowedTools.join(', ')
+      : '未限制（优先使用内置健康工具）'
+  }
 
-      let title = "聊天失败"
-      let description = error.message || "聊天服务出现错误，请稍后重试"
-
-      if (error.message.includes('请登录后再使用')) {
-        title = "需要登录"
-        description = "请登录后再使用AI聊天功能"
-      } else if (error.message.includes('使用次数已达上限')) {
-        title = "使用次数已达上限"
-      } else if (error.message.includes('服务暂时不可用')) {
-        title = "服务暂时不可用"
-      } else if (!checkAIConfig()) {
-        title = "AI 配置不完整"
-        description = "请先在设置页面配置聊天模型"
-      }
-
-      toast({
-        title,
-        description,
-        variant: "destructive",
-      })
-    },
-    onFinish: async (message) => {
-      console.log("Chat finished:", {
-        messageLength: message.content.length,
-        role: message.role,
-      })
-
-      if (message.role === 'assistant') {
-        console.log('[Chat] Refreshing usage info after successful chat')
-        refreshUsageInfo()
-
-        // 尝试从助理消息中解析并执行 MCP 工具调用指令
-        try {
-          const directives = parseMCPDirectives(message.content)
-          for (const d of directives) {
-            const callResult = await routeMCPCall(d)
-            const toolResultMessage: Message = {
-              id: `assistant-tool-${Date.now()}-${d.name}`,
-              role: 'assistant',
-              content: formatToolResultForChat(d.name, callResult)
-            }
-            setMessages(curr => [...curr, toolResultMessage])
-          }
-        } catch (e) {
-          console.warn('解析/执行 MCP 指令失败:', e)
-        }
-      }
-    },
-    body: {
-      userProfile: includeHealthData ? userProfile : undefined,
-      healthData: includeHealthData ? todayLog : undefined,
-      recentHealthData: includeHealthData ? recentHealthData : undefined,
-      systemPrompt: `${currentExpert.systemPrompt}\n\n${TOOL_CALL_INSTRUCTIONS}\n\n允许的工具：${(() => { try { const allowed = JSON.parse(localStorage.getItem('mcp.allowedTools') || '[]'); return Array.isArray(allowed) && allowed.length > 0 ? allowed.join(', ') : '未限制（优先使用内置健康工具）'; } catch { return '未限制（优先使用内置健康工具）'; } })()}`,
-      expertRole: currentExpert,
-      aiMemory: memories,
-      aiConfig, // 添加缺失的 aiConfig
-      allowedTools,
-    },
+  const getChatRequestBody = (chatMessages: ChatMessage[]) => ({
+    messages: chatMessages.map(msg => ({
+      role: msg.role,
+      content: msg.content,
+      images: (msg as ChatMessage).images
+    })),
+    userProfile: includeHealthData ? userProfile : undefined,
+    healthData: includeHealthData ? todayLog : undefined,
+    recentHealthData: includeHealthData ? recentHealthData : undefined,
+    systemPrompt: `${currentExpert.systemPrompt}\n\n${TOOL_CALL_INSTRUCTIONS}\n\n允许的工具：${getAllowedToolsLabel()}`,
+    expertRole: currentExpert,
+    aiMemory: memories,
+    aiConfig,
+    allowedTools
   })
+
+  const handleChatError = (error: Error) => {
+    console.error("Chat error:", error)
+    setChatError(error)
+
+    let title = "聊天失败"
+    let description = error.message || "聊天服务出现错误，请稍后重试"
+
+    if (error.message.includes('请登录后再使用')) {
+      title = "需要登录"
+      description = "请登录后再使用AI聊天功能"
+    } else if (error.message.includes('使用次数已达上限')) {
+      title = "使用次数已达上限"
+    } else if (error.message.includes('服务暂时不可用')) {
+      title = "服务暂时不可用"
+    } else if (!checkAIConfig()) {
+      title = "AI 配置不完整"
+      description = "请先在设置页面配置聊天模型"
+    }
+
+    toast({
+      title,
+      description,
+      variant: "destructive",
+    })
+  }
+
+  const finishAssistantMessage = async (assistantMessage: ChatMessage) => {
+    console.log("Chat finished:", {
+      messageLength: assistantMessage.content.length,
+      role: assistantMessage.role,
+    })
+
+    console.log('[Chat] Refreshing usage info after successful chat')
+    refreshUsageInfo()
+
+    try {
+      const directives = parseMCPDirectives(assistantMessage.content)
+      for (const d of directives) {
+        const callResult = await routeMCPCall(d)
+        const toolResultMessage: ChatMessage = {
+          id: `assistant-tool-${Date.now()}-${d.name}`,
+          role: 'assistant',
+          content: formatToolResultForChat(d.name, callResult)
+        }
+        setMessages(curr => [...curr, toolResultMessage])
+      }
+    } catch (e) {
+      console.warn('解析/执行 MCP 指令失败:', e)
+    }
+  }
+
+  const submitChatMessages = async (chatMessages: ChatMessage[]) => {
+    const assistantMessage: ChatMessage = {
+      id: `assistant-${Date.now()}`,
+      role: 'assistant',
+      content: ''
+    }
+
+    setChatError(null)
+
+    const response = await fetch('/api/openai/chat', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        "x-ai-config": JSON.stringify(aiConfig),
+        "x-expert-role": selectedExpert,
+      },
+      body: JSON.stringify(getChatRequestBody(chatMessages))
+    })
+
+    console.log("Chat response received:", {
+      ok: response.ok,
+      status: response.status,
+      statusText: response.statusText,
+    })
+
+    if (!response.ok) {
+      throw new Error(`服务器响应错误: ${response.status} ${response.statusText}`)
+    }
+
+    setMessages([...chatMessages, assistantMessage])
+
+    const reader = response.body?.getReader()
+    const decoder = new TextDecoder('utf-8')
+    let assistantContent = ''
+
+    if (reader) {
+      try {
+        let buffer = ''
+
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || ''
+
+          for (const line of lines) {
+            if (line.startsWith('0:"')) {
+              try {
+                const content = line.slice(3, -1)
+                const decodedContent = content.replace(/\\"/g, '"').replace(/\\n/g, '\n')
+                assistantContent += decodedContent
+
+                setMessages(currentMessages => {
+                  const updatedMessages = [...currentMessages]
+                  const lastMessage = updatedMessages[updatedMessages.length - 1]
+                  if (lastMessage && lastMessage.id === assistantMessage.id) {
+                    updatedMessages[updatedMessages.length - 1] = {
+                      ...lastMessage,
+                      content: lastMessage.content + decodedContent
+                    }
+                  }
+                  return updatedMessages
+                })
+              } catch (e) {
+                console.error('Error parsing stream chunk:', e)
+              }
+            }
+          }
+        }
+      } finally {
+        reader.releaseLock()
+      }
+    }
+
+    await finishAssistantMessage({ ...assistantMessage, content: assistantContent })
+  }
 
   // 当切换专家时，加载对应的消息记录
   useEffect(() => {
@@ -333,7 +404,7 @@ export default function ChatPage() {
   useEffect(() => {
     if (messages.length > 0 && !isLoadingMessagesRef.current) {
       const newMessages = { ...allExpertMessages }
-      newMessages[selectedExpert] = messages as Message[]
+      newMessages[selectedExpert] = messages
       setAllExpertMessages(newMessages)
     }
   }, [messages, selectedExpert, setAllExpertMessages])
@@ -366,13 +437,13 @@ export default function ChatPage() {
     setMessages(updatedMessages)
 
     const newAllMessages = { ...allExpertMessages }
-    newAllMessages[selectedExpert] = updatedMessages as Message[]
+    newAllMessages[selectedExpert] = updatedMessages
     setAllExpertMessages(newAllMessages)
   }
 
   // 重试用户消息
   const handleRetryMessage = async (messageIndex: number) => {
-    if (isLoading || isCustomLoading) return
+    if (isCustomLoading) return
 
     const messageToRetry = messages[messageIndex]
     if (messageToRetry.role !== 'user') return
@@ -385,90 +456,9 @@ export default function ChatPage() {
     setMessages(newMessages)
 
     try {
-      const response = await fetch('/api/openai/chat', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          "x-ai-config": JSON.stringify(aiConfig),
-          "x-expert-role": selectedExpert,
-        },
-        body: JSON.stringify({
-          messages: newMessages.map(msg => ({
-            role: msg.role,
-            content: msg.content,
-            // @ts-ignore
-            images: msg.images
-          })),
-          userProfile: includeHealthData ? userProfile : undefined,
-          healthData: includeHealthData ? todayLog : undefined,
-          recentHealthData: includeHealthData ? recentHealthData : undefined,
-          systemPrompt: currentExpert.systemPrompt,
-          expertRole: currentExpert,
-          aiMemory: memories,
-          aiConfig,
-          allowedTools
-        })
-      })
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`)
-      }
-
-      const newAssistantMessage: Message = {
-        id: `assistant-${Date.now()}`,
-        role: 'assistant',
-        content: ''
-      }
-
-      setMessages([...newMessages, newAssistantMessage])
-
-      const reader = response.body?.getReader()
-      const decoder = new TextDecoder('utf-8')
-
-      if (reader) {
-        try {
-          let buffer = ''
-
-          while (true) {
-            const { done, value } = await reader.read()
-            if (done) break
-
-            buffer += decoder.decode(value, { stream: true })
-            const lines = buffer.split('\n')
-            buffer = lines.pop() || ''
-
-            for (const line of lines) {
-              if (line.startsWith('0:"')) {
-                try {
-                  const content = line.slice(3, -1)
-                  const decodedContent = content.replace(/\\"/g, '"').replace(/\\n/g, '\n')
-
-                  setMessages(currentMessages => {
-                    const updatedMessages = [...currentMessages]
-                    const lastMessage = updatedMessages[updatedMessages.length - 1]
-                    if (lastMessage && lastMessage.role === 'assistant') {
-                      lastMessage.content += decodedContent
-                    }
-                    return updatedMessages
-                  })
-                } catch (e) {
-                  console.error('Error parsing stream chunk:', e)
-                }
-              }
-            }
-          }
-        } finally {
-          reader.releaseLock()
-        }
-      }
-
+      await submitChatMessages(newMessages)
     } catch (error) {
-      console.error('Error retrying message:', error)
-      toast({
-        title: "重试失败",
-        description: error instanceof Error ? error.message : "重试消息时出现错误",
-        variant: "destructive",
-      })
+      handleChatError(error instanceof Error ? error : new Error("重试消息时出现错误"))
     } finally {
       setIsCustomLoading(false)
     }
@@ -480,7 +470,7 @@ export default function ChatPage() {
   }, [messages])
 
   // 组合加载状态
-  const isAnyLoading = isLoading || isCustomLoading
+  const isAnyLoading = isCustomLoading
 
   const onSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
@@ -508,8 +498,35 @@ export default function ChatPage() {
     if (uploadedImages.length > 0) {
       await handleSubmitWithImages(e)
     } else {
-      handleSubmit(e)
+      setIsCustomLoading(true)
+
+      const userMessage: ChatMessage = {
+        id: `user-${Date.now()}`,
+        role: 'user',
+        content: input.trim()
+      }
+      const newMessages = [...messages, userMessage]
+      setMessages(newMessages)
+      setInput('')
+
+      try {
+        await submitChatMessages(newMessages)
+      } catch (error) {
+        setMessages(newMessages)
+        handleChatError(error instanceof Error ? error : new Error("发送消息时出现错误"))
+      } finally {
+        setIsCustomLoading(false)
+      }
     }
+  }
+
+  const fileToDataURI = (file: File) => {
+    return new Promise<string>((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => resolve(String(reader.result))
+      reader.onerror = () => reject(reader.error || new Error("图片读取失败"))
+      reader.readAsDataURL(file)
+    })
   }
 
   // 处理包含图片的提交
@@ -521,10 +538,7 @@ export default function ChatPage() {
       const imageDataURIs: string[] = []
       for (const img of uploadedImages) {
         const fileToUse = img.compressedFile || img.file
-        const arrayBuffer = await fileToUse.arrayBuffer()
-        const base64 = Buffer.from(arrayBuffer).toString('base64')
-        const dataURI = `data:${fileToUse.type};base64,${base64}`
-        imageDataURIs.push(dataURI)
+        imageDataURIs.push(await fileToDataURI(fileToUse))
       }
 
       const userMessage: ChatMessage = {
@@ -540,100 +554,13 @@ export default function ChatPage() {
       setInput('')
       clearAllImages()
 
-      const response = await fetch('/api/openai/chat', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          "x-ai-config": JSON.stringify(aiConfig),
-          "x-expert-role": selectedExpert,
-        },
-        body: JSON.stringify({
-          messages: newMessages.map(msg => ({
-            role: msg.role,
-            content: msg.content,
-            images: (msg as ChatMessage).images
-          })),
-          userProfile: includeHealthData ? userProfile : undefined,
-          healthData: includeHealthData ? todayLog : undefined,
-          recentHealthData: includeHealthData ? recentHealthData : undefined,
-          systemPrompt: currentExpert.systemPrompt,
-          expertRole: currentExpert,
-          aiMemory: memories,
-          aiConfig,
-          allowedTools
-        })
-      })
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`)
-      }
-
-      const assistantMessage: Message = {
-        id: `assistant-${Date.now()}`,
-        role: 'assistant',
-        content: ''
-      }
-
-      setMessages([...newMessages, assistantMessage])
-
-      const reader = response.body?.getReader()
-      const decoder = new TextDecoder('utf-8')
-
-      if (reader) {
-        try {
-          let buffer = ''
-
-          while (true) {
-            const { done, value } = await reader.read()
-            if (done) break
-
-            buffer += decoder.decode(value, { stream: true })
-            const lines = buffer.split('\n')
-            buffer = lines.pop() || ''
-
-            for (const line of lines) {
-              if (line.startsWith('0:"')) {
-                try {
-                  const content = line.slice(3, -1)
-                  const decodedContent = content.replace(/\\"/g, '"').replace(/\\n/g, '\n')
-
-                  setMessages(currentMessages => {
-                    const updatedMessages = [...currentMessages]
-                    const lastMessage = updatedMessages[updatedMessages.length - 1]
-                    if (lastMessage && lastMessage.role === 'assistant') {
-                      lastMessage.content += decodedContent
-                    }
-                    return updatedMessages
-                  })
-                } catch (e) {
-                  console.error('Error parsing stream chunk:', e)
-                }
-              }
-            }
-          }
-        } finally {
-          reader.releaseLock()
-        }
-      }
-
+      await submitChatMessages(newMessages)
     } catch (error) {
-      console.error('Error submitting with images:', error)
-      toast({
-        title: "发送失败",
-        description: error instanceof Error ? error.message : "发送消息时出现错误",
-        variant: "destructive",
-      })
+      handleChatError(error instanceof Error ? error : new Error("发送消息时出现错误"))
     } finally {
       setIsCustomLoading(false)
     }
   }
-
-  // 显示错误信息
-  useEffect(() => {
-    if (error) {
-      console.error("useChat error:", error)
-    }
-  }, [error])
 
   return (
     <div className="container mx-auto py-2 md:py-6 max-w-7xl min-w-0 px-3 md:px-6">
@@ -657,7 +584,7 @@ export default function ChatPage() {
             hasMessages={messages.length > 0}
             isClient={isClient}
             checkAIConfig={checkAIConfig}
-            error={error || null}
+            error={chatError}
             onClearHistory={clearChatHistory}
             onExportConversation={() => handleExportConversationAsImage(messages, currentExpert, expertInfo)}
             isMobile={isMobile}
@@ -722,7 +649,7 @@ export default function ChatPage() {
                 userProfile={includeHealthData ? userProfile : undefined}
                 healthData={includeHealthData ? todayLog : undefined}
                 onToolResult={(result, toolName) => {
-                  const toolResultMessage: Message = {
+                  const toolResultMessage: ChatMessage = {
                     id: `assistant-tool-${Date.now()}-${toolName}`,
                     role: 'assistant',
                     content: formatToolResultForChat(toolName, { success: true, result })

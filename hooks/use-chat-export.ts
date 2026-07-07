@@ -1,7 +1,6 @@
 import { useCallback } from "react"
 import { useToast } from "@/hooks/use-toast"
-import type { Message } from "ai"
-import type { ExpertRole, ExpertDisplayInfo } from "@/types/chat"
+import type { ExpertRole, ExpertDisplayInfo, ChatMessage } from "@/types/chat"
 import React from "react"
 
 export function useChatExport() {
@@ -303,7 +302,7 @@ export function useChatExport() {
     }
   }, [toast])
 
-  const handleExportConversationAsImage = useCallback(async (messages: Message[], currentExpert: ExpertRole, expertInfo: ExpertDisplayInfo) => {
+  const handleExportConversationAsImage = useCallback(async (messages: ChatMessage[], currentExpert: ExpertRole, expertInfo: ExpertDisplayInfo) => {
     if (messages.length === 0) {
       toast({
         title: "无法导出",
