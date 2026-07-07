@@ -3,6 +3,8 @@
  * MCP服务器的数据访问层
  */
 
+import { logInfo } from '@/lib/logging'
+
 export class DatabaseService {
   private connectionUrl: string
 

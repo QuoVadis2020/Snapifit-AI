@@ -345,6 +345,23 @@ export default function ChatPage() {
     const reader = response.body?.getReader()
     const decoder = new TextDecoder('utf-8')
     let assistantContent = ''
+    let streamProtocol: 'text' | 'data' | null = null
+    const appendAssistantContent = (content: string) => {
+      if (!content) return
+      assistantContent += content
+
+      setMessages(currentMessages => {
+        const updatedMessages = [...currentMessages]
+        const lastMessage = updatedMessages[updatedMessages.length - 1]
+        if (lastMessage && lastMessage.id === assistantMessage.id) {
+          updatedMessages[updatedMessages.length - 1] = {
+            ...lastMessage,
+            content: lastMessage.content + content
+          }
+        }
+        return updatedMessages
+      })
+    }
 
     if (reader) {
       try {
@@ -354,7 +371,22 @@ export default function ChatPage() {
           const { done, value } = await reader.read()
           if (done) break
 
-          buffer += decoder.decode(value, { stream: true })
+          const decodedChunk = decoder.decode(value, { stream: true })
+          buffer += decodedChunk
+
+          if (streamProtocol === null) {
+            const trimmedChunk = decodedChunk.trimStart()
+            streamProtocol = trimmedChunk.startsWith('0:"') || trimmedChunk.startsWith('d:') || trimmedChunk.startsWith('data: ')
+              ? 'data'
+              : 'text'
+          }
+
+          if (streamProtocol === 'text') {
+            appendAssistantContent(decodedChunk)
+            buffer = ''
+            continue
+          }
+
           const lines = buffer.split('\n')
           buffer = lines.pop() || ''
 
@@ -363,19 +395,7 @@ export default function ChatPage() {
               try {
                 const content = line.slice(3, -1)
                 const decodedContent = content.replace(/\\"/g, '"').replace(/\\n/g, '\n')
-                assistantContent += decodedContent
-
-                setMessages(currentMessages => {
-                  const updatedMessages = [...currentMessages]
-                  const lastMessage = updatedMessages[updatedMessages.length - 1]
-                  if (lastMessage && lastMessage.id === assistantMessage.id) {
-                    updatedMessages[updatedMessages.length - 1] = {
-                      ...lastMessage,
-                      content: lastMessage.content + decodedContent
-                    }
-                  }
-                  return updatedMessages
-                })
+                appendAssistantContent(decodedContent)
               } catch (e) {
                 console.error('Error parsing stream chunk:', e)
               }

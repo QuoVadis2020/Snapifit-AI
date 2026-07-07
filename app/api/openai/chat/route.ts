@@ -3,7 +3,7 @@ import { formatDailyStatusForAI } from "@/lib/utils"
 import { checkApiAuth, rollbackUsageIfNeeded } from '@/lib/auth/api-helper'
 import type { DailyLog, UserProfile, AIConfig } from "@/lib/types"
 import { z } from 'zod'
-import { streamText, tool } from 'ai'
+import { streamText, tool, stepCountIs } from 'ai'
 import { createOpenAI } from '@ai-sdk/openai'
 import { KeyManager } from '@/lib/auth/key-manager'
 import { handleApiError } from '@/lib/api/error-handler'
@@ -613,7 +613,7 @@ export async function POST(req: Request) {
 
       const healthTool = tool({
         description: '调用内置健康工具',
-        parameters: z.object({
+        inputSchema: z.object({
           name: z.string(),
           params: z.record(z.any()).default({})
         }),
@@ -633,7 +633,7 @@ export async function POST(req: Request) {
 
       const externalMCP = tool({
         description: '调用外部 MCP Provider 工具',
-        parameters: z.object({
+        inputSchema: z.object({
           provider_id: z.string(),
           tool_name: z.string(),
           params: z.record(z.any()).default({})
@@ -657,10 +657,10 @@ export async function POST(req: Request) {
         system: systemPrompt,
         messages: cleanMessages as any,
         tools: { healthTool, externalMCP },
-        maxSteps: 4
+        stopWhen: stepCountIs(4)
       })
 
-      return result.toDataStreamResponse()
+      return result.toTextStreamResponse()
     }
 
     // ========== 共享模式：尝试用共享池的Key + AI SDK tools ==========
@@ -676,7 +676,7 @@ export async function POST(req: Request) {
 
       const healthTool = tool({
         description: '调用内置健康工具',
-        parameters: z.object({ name: z.string(), params: z.record(z.any()).default({}) }),
+        inputSchema: z.object({ name: z.string(), params: z.record(z.any()).default({}) }),
         execute: async ({ name, params }) => {
           if (!isToolAllowed(name)) {
             return { success: false, error: `工具未被允许: ${name}` }
@@ -689,7 +689,7 @@ export async function POST(req: Request) {
       })
       const externalMCP = tool({
         description: '调用外部 MCP Provider 工具',
-        parameters: z.object({ provider_id: z.string(), tool_name: z.string(), params: z.record(z.any()).default({}) }),
+        inputSchema: z.object({ provider_id: z.string(), tool_name: z.string(), params: z.record(z.any()).default({}) }),
         execute: async ({ provider_id, tool_name, params }) => {
           if (!isToolAllowed(tool_name)) {
             return { success: false, error: `工具未被允许: ${tool_name}` }
@@ -701,14 +701,20 @@ export async function POST(req: Request) {
         }
       })
 
-      const result = await streamText({ model, system: systemPrompt, messages: cleanMessages as any, tools: { healthTool, externalMCP }, maxSteps: 4 })
+      const result = await streamText({
+        model,
+        system: systemPrompt,
+        messages: cleanMessages as any,
+        tools: { healthTool, externalMCP },
+        stopWhen: stepCountIs(4)
+      })
 
       // 简单成功计数
       if (key.id) {
         try { await keyManager.logKeyUsage(key.id, { sharedKeyId: key.id, userId: session.user.id, apiEndpoint: '/chat/completions', modelUsed: selectedModel, success: true }) } catch {}
       }
 
-      return result.toDataStreamResponse()
+      return result.toTextStreamResponse()
     } catch (e) {
       // 回退到旧的 SharedOpenAIClient 流式
       const { stream } = await sharedClient.streamText({ model: selectedModel, messages: cleanMessages, system: systemPrompt })
