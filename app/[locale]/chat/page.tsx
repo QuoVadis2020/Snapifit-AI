@@ -393,8 +393,7 @@ export default function ChatPage() {
           for (const line of lines) {
             if (line.startsWith('0:"')) {
               try {
-                const content = line.slice(3, -1)
-                const decodedContent = content.replace(/\\"/g, '"').replace(/\\n/g, '\n')
+                const decodedContent = JSON.parse(line.slice(2))
                 appendAssistantContent(decodedContent)
               } catch (e) {
                 console.error('Error parsing stream chunk:', e)

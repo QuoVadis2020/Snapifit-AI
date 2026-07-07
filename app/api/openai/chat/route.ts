@@ -2,12 +2,7 @@
 import { formatDailyStatusForAI } from "@/lib/utils"
 import { checkApiAuth, rollbackUsageIfNeeded } from '@/lib/auth/api-helper'
 import type { DailyLog, UserProfile, AIConfig } from "@/lib/types"
-import { z } from 'zod'
-import { streamText, tool, stepCountIs } from 'ai'
-import { createOpenAI } from '@ai-sdk/openai'
-import { KeyManager } from '@/lib/auth/key-manager'
 import { handleApiError } from '@/lib/api/error-handler'
-import { timeoutFetch } from '@/lib/utils/timeout'
 import { logDebug, logError } from '@/lib/logging'
 
 export async function POST(req: Request) {
@@ -603,147 +598,9 @@ export async function POST(req: Request) {
       })
     }
 
-    // ========== 使用 AI SDK (tools) 流式响应（私有模式优先） ==========
-    if (modelConfig?.source === 'private' && fallbackConfig?.apiKey) {
-      const openai = createOpenAI({ apiKey: fallbackConfig.apiKey, baseURL: fallbackConfig.baseUrl })
-      const model = openai.chat(selectedModel)
-
-      const cookie = req.headers.get('cookie') || ''
-      const isToolAllowed = (name: string) => allowedTools.length === 0 || allowedTools.includes(name)
-
-      const healthTool = tool({
-        description: '调用内置健康工具',
-        inputSchema: z.object({
-          name: z.string(),
-          params: z.record(z.any()).default({})
-        }),
-        execute: async ({ name, params }) => {
-          if (!isToolAllowed(name)) {
-            return { success: false, error: `工具未被允许: ${name}` }
-          }
-          const res = await timeoutFetch(`${process.env.NEXT_PUBLIC_BASE_URL || ''}/api/mcp/health-data`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', cookie },
-            body: JSON.stringify({ tool: name, params }),
-            timeoutMs: 10_000
-          })
-          return await res.json()
-        }
-      })
-
-      const externalMCP = tool({
-        description: '调用外部 MCP Provider 工具',
-        inputSchema: z.object({
-          provider_id: z.string(),
-          tool_name: z.string(),
-          params: z.record(z.any()).default({})
-        }),
-        execute: async ({ provider_id, tool_name, params }) => {
-          if (!isToolAllowed(tool_name)) {
-            return { success: false, error: `工具未被允许: ${tool_name}` }
-          }
-          const res = await timeoutFetch(`${process.env.NEXT_PUBLIC_BASE_URL || ''}/api/mcp/bridge`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', cookie },
-            body: JSON.stringify({ action: 'call_tool', provider_id, tool_name, params }),
-            timeoutMs: 10_000
-          })
-          return await res.json()
-        }
-      })
-
-      const result = await streamText({
-        model,
-        system: systemPrompt,
-        messages: cleanMessages as any,
-        tools: { healthTool, externalMCP },
-        stopWhen: stepCountIs(4)
-      })
-
-      return result.toTextStreamResponse()
-    }
-
-    // ========== 共享模式：尝试用共享池的Key + AI SDK tools ==========
-    try {
-      const keyManager = new KeyManager()
-      const { key, error } = await keyManager.getAvailableKey(selectedModel)
-      if (!key || error) throw new Error(error || 'No shared key available')
-
-      const openai = createOpenAI({ apiKey: key.apiKey, baseURL: key.baseUrl })
-      const model = openai.chat(selectedModel)
-      const cookie = req.headers.get('cookie') || ''
-      const isToolAllowed = (name: string) => allowedTools.length === 0 || allowedTools.includes(name)
-
-      const healthTool = tool({
-        description: '调用内置健康工具',
-        inputSchema: z.object({ name: z.string(), params: z.record(z.any()).default({}) }),
-        execute: async ({ name, params }) => {
-          if (!isToolAllowed(name)) {
-            return { success: false, error: `工具未被允许: ${name}` }
-          }
-          const res = await timeoutFetch(`${process.env.NEXT_PUBLIC_BASE_URL || ''}/api/mcp/health-data`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json', cookie }, body: JSON.stringify({ tool: name, params }), timeoutMs: 10_000
-          })
-          return await res.json()
-        }
-      })
-      const externalMCP = tool({
-        description: '调用外部 MCP Provider 工具',
-        inputSchema: z.object({ provider_id: z.string(), tool_name: z.string(), params: z.record(z.any()).default({}) }),
-        execute: async ({ provider_id, tool_name, params }) => {
-          if (!isToolAllowed(tool_name)) {
-            return { success: false, error: `工具未被允许: ${tool_name}` }
-          }
-          const res = await timeoutFetch(`${process.env.NEXT_PUBLIC_BASE_URL || ''}/api/mcp/bridge`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json', cookie }, body: JSON.stringify({ action: 'call_tool', provider_id, tool_name, params }), timeoutMs: 10_000
-          })
-          return await res.json()
-        }
-      })
-
-      const result = await streamText({
-        model,
-        system: systemPrompt,
-        messages: cleanMessages as any,
-        tools: { healthTool, externalMCP },
-        stopWhen: stepCountIs(4)
-      })
-
-      // 简单成功计数
-      if (key.id) {
-        try { await keyManager.logKeyUsage(key.id, { sharedKeyId: key.id, userId: session.user.id, apiEndpoint: '/chat/completions', modelUsed: selectedModel, success: true }) } catch {}
-      }
-
-      return result.toTextStreamResponse()
-    } catch (e) {
-      // 回退到旧的 SharedOpenAIClient 流式
-      const { stream } = await sharedClient.streamText({ model: selectedModel, messages: cleanMessages, system: systemPrompt })
-      const encoder = new TextEncoder()
-      const transformedStream = new ReadableStream({
-        async start(controller) {
-          let isControllerClosed = false
-          const closeController = () => { if (!isControllerClosed) { isControllerClosed = true; controller.close() } }
-          const enqueueData = (data: Uint8Array) => { if (!isControllerClosed) controller.enqueue(data) }
-          try {
-            const reader = stream.body?.getReader(); if (!reader) throw new Error('No stream reader available')
-            const decoder = new TextDecoder('utf-8'); let buffer = ''
-            while (true) {
-              const { done, value } = await reader.read(); if (done) break
-              buffer += decoder.decode(value, { stream: true }); const lines = buffer.split('\n'); buffer = lines.pop() || ''
-              for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                  const data = line.slice(6)
-                  if (data === '[DONE]') { enqueueData(encoder.encode(`d:{"finishReason":"stop","usage":{"promptTokens":0,"completionTokens":0}}\n`)); closeController(); return }
-                  try { const parsed = JSON.parse(data); const content = parsed.choices?.[0]?.delta?.content; if (content) enqueueData(encoder.encode(`0:"${content.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"\n`)) } catch {}
-                }
-              }
-            }
-            enqueueData(encoder.encode(`d:{"finishReason":"stop","usage":{"promptTokens":0,"completionTokens":0}}\n`)); closeController()
-          } catch (error) { if (!isControllerClosed) controller.error(error) }
-        }
-      })
-      return new Response(transformedStream, { headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Transfer-Encoding': 'chunked' } })
-    }
+    // 前端已通过 <tool_call> 指令处理 MCP 工具调用；这里保持供应商兼容的 OpenAI SSE 通道。
+    const { stream } = await sharedClient.streamText({ model: selectedModel, messages: cleanMessages, system: systemPrompt })
+    return toChatDataStreamResponse(stream)
   } catch (error) {
     logError('chat_api_error', { error: error instanceof Error ? error.message : String(error) })
     if (session?.user?.id) {
@@ -751,6 +608,85 @@ export async function POST(req: Request) {
     }
     return handleApiError(error, 500)
   }
+}
+
+function toChatDataStreamResponse(stream: Response): Response {
+  const encoder = new TextEncoder()
+  const transformedStream = new ReadableStream({
+    async start(controller) {
+      let isControllerClosed = false
+      const closeController = () => {
+        if (!isControllerClosed) {
+          isControllerClosed = true
+          controller.close()
+        }
+      }
+      const enqueueData = (data: Uint8Array) => {
+        if (!isControllerClosed) controller.enqueue(data)
+      }
+      const enqueueText = (content: string) => {
+        if (content) enqueueData(encoder.encode(`0:${JSON.stringify(content)}\n`))
+      }
+
+      try {
+        const reader = stream.body?.getReader()
+        if (!reader) throw new Error('No stream reader available')
+
+        const decoder = new TextDecoder('utf-8')
+        let buffer = ''
+        let detectedProtocol: 'sse' | 'text' | null = null
+
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          const chunk = decoder.decode(value, { stream: true })
+
+          if (detectedProtocol === null) {
+            detectedProtocol = chunk.trimStart().startsWith('data: ') ? 'sse' : 'text'
+          }
+
+          if (detectedProtocol === 'text') {
+            enqueueText(chunk)
+            continue
+          }
+
+          buffer += chunk
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || ''
+
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue
+
+            const data = line.slice(6)
+            if (data === '[DONE]') {
+              enqueueData(encoder.encode(`d:{"finishReason":"stop","usage":{"promptTokens":0,"completionTokens":0}}\n`))
+              closeController()
+              return
+            }
+
+            try {
+              const parsed = JSON.parse(data)
+              const content = parsed.choices?.[0]?.delta?.content
+              if (typeof content === 'string') enqueueText(content)
+            } catch {}
+          }
+        }
+
+        enqueueData(encoder.encode(`d:{"finishReason":"stop","usage":{"promptTokens":0,"completionTokens":0}}\n`))
+        closeController()
+      } catch (error) {
+        if (!isControllerClosed) controller.error(error)
+      }
+    }
+  })
+
+  return new Response(transformedStream, {
+    headers: {
+      'Content-Type': 'text/plain; charset=utf-8',
+      'Cache-Control': 'no-cache'
+    }
+  })
 }
 
 // 获取下次重置时间
